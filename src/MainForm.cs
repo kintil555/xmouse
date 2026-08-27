@@ -49,6 +49,9 @@ public class MainForm : Form
         BuildTrayIcon();
         LoadConfigIntoUi();
 
+        // _engine.Start() bisa throw InvalidOperationException kalau pasang hook
+        // gagal (mis. butuh Administrator) -- biarkan exception naik ke Program.cs
+        // supaya pengguna dapat pesan jelas, bukan aplikasi diam-diam tidak jalan.
         _engine.Start();
 
         if (startMinimized || _config.StartMinimized)
@@ -292,8 +295,11 @@ public class MainForm : Form
 
     private void ExitApplication()
     {
-        _engine.Dispose();
+        // Sembunyikan tray icon dulu sebelum Dispose engine, supaya UI terasa
+        // responsif langsung -- Dispose() (Stop hook + join worker thread, maks
+        // 500ms) tidak lagi membuat tray icon menggantung terlihat oleh pengguna.
         _trayIcon.Visible = false;
+        _engine.Dispose();
         _trayIcon.Dispose();
         Application.Exit();
     }
