@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using static XMouse.NativeMethods;
@@ -7,22 +8,33 @@ namespace XMouse;
 /// <summary>
 /// Memasang low-level mouse hook (WH_MOUSE_LL) dan menerapkan remap
 /// sesuai <see cref="RemapConfig"/> yang aktif.
+///
+/// PENTING (stabilitas): Windows memaksa hook WH_MOUSE_LL punya batas waktu respons
+/// (LowLevelHooksTimeout, default ~300ms) yang berjalan di thread UI. Kalau callback
+/// ini telat merespons -- termasuk karena memanggil SendInput/mouse_event yang
+/// menunggu OS memproses input -- Windows bisa mem-freeze seluruh input sistem
+/// ("Not Responding") atau diam-diam melepas hook kita. Karena itu:
+///   1) HookCallback WAJIB selesai secepat mungkin (idealnya < 1ms), tidak pernah
+///      memanggil apapun yang bisa blocking.
+///   2) Semua aksi "berat" (mengirim klik sintetis) dilempar ke background queue,
+///      diproses oleh worker thread terpisah -- bukan dieksekusi langsung di callback.
 /// </summary>
 public sealed class MouseHookEngine : IDisposable
 {
     private IntPtr _hookHandle = IntPtr.Zero;
     private readonly LowLevelMouseProc _proc;
-    private RemapConfig _config;
-
-    // Untuk deteksi double-click buatan per tombol.
-    private readonly Stopwatch _leftStopwatch = new();
-    private readonly Stopwatch _rightStopwatch = new();
-    private readonly Stopwatch _middleStopwatch = new();
+    private volatile RemapConfig _config;
 
     // Menandai klik yang sedang kita proses ulang (suppress asli, lalu kita ganti).
-    private bool _suppressNextLeftUpEcho;
-    private bool _suppressNextRightUpEcho;
-    private bool _suppressNextMiddleUpEcho;
+    private volatile bool _suppressNextLeftUpEcho;
+    private volatile bool _suppressNextRightUpEcho;
+    private volatile bool _suppressNextMiddleUpEcho;
+
+    // Queue aksi klik sintetis + worker thread khusus, supaya hook callback
+    // tidak pernah menunggu SendInput/mouse_event selesai.
+    private readonly BlockingCollection<(uint down, uint up, int repeat)> _actionQueue = new();
+    private Thread? _workerThread;
+    private volatile bool _running;
 
     public MouseHookEngine(RemapConfig initialConfig)
     {
@@ -36,6 +48,14 @@ public sealed class MouseHookEngine : IDisposable
     {
         if (_hookHandle != IntPtr.Zero) return;
 
+        _running = true;
+        _workerThread = new Thread(ActionWorkerLoop)
+        {
+            IsBackground = true,
+            Name = "xmouse-action-worker",
+        };
+        _workerThread.Start();
+
         using var curProcess = Process.GetCurrentProcess();
         using var curModule = curProcess.MainModule!;
         _hookHandle = SetWindowsHookEx(
@@ -46,6 +66,8 @@ public sealed class MouseHookEngine : IDisposable
 
         if (_hookHandle == IntPtr.Zero)
         {
+            _running = false;
+            _actionQueue.CompleteAdding();
             throw new InvalidOperationException(
                 "Gagal memasang mouse hook. Coba jalankan xmouse sebagai Administrator.");
         }
@@ -53,15 +75,81 @@ public sealed class MouseHookEngine : IDisposable
 
     public void Stop()
     {
-        if (_hookHandle == IntPtr.Zero) return;
-        UnhookWindowsHookEx(_hookHandle);
-        _hookHandle = IntPtr.Zero;
+        if (_hookHandle != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_hookHandle);
+            _hookHandle = IntPtr.Zero;
+        }
+
+        _running = false;
+        if (!_actionQueue.IsAddingCompleted)
+            _actionQueue.CompleteAdding();
+
+        // Beri worker thread kesempatan keluar dengan bersih (timeout singkat,
+        // jangan sampai Dispose/Stop ikut nge-block UI thread lama-lama).
+        _workerThread?.Join(TimeSpan.FromMilliseconds(500));
+    }
+
+    /// <summary>
+    /// Worker thread terpisah yang benar-benar mengirim klik sintetis ke OS.
+    /// Berjalan di luar hook callback sehingga tidak pernah membuat
+    /// WH_MOUSE_LL telat merespons.
+    /// </summary>
+    private void ActionWorkerLoop()
+    {
+        try
+        {
+            foreach (var (down, up, repeat) in _actionQueue.GetConsumingEnumerable())
+            {
+                for (int i = 0; i < repeat; i++)
+                {
+                    mouse_event(down, 0, 0, 0, (UIntPtr)XMOUSE_INJECTED_SIGNATURE);
+                    mouse_event(up, 0, 0, 0, (UIntPtr)XMOUSE_INJECTED_SIGNATURE);
+                }
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // Queue sudah CompleteAdding + kosong -> keluar dengan tenang.
+        }
+    }
+
+    private void EnqueueClick(uint down, uint up, int repeat = 1)
+    {
+        if (!_running) return;
+        try
+        {
+            _actionQueue.Add((down, up, repeat));
+        }
+        catch (InvalidOperationException)
+        {
+            // Queue sedang ditutup (aplikasi sedang Stop) -> abaikan.
+        }
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode < 0 || !_config.Enabled)
+        // Jalur keluar tercepat mungkin: hindari kerja apapun kalau hook nonaktif
+        // atau nCode negatif (harus selalu diteruskan apa adanya ke CallNextHookEx).
+        if (nCode < 0)
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+
+        var config = _config; // baca sekali (volatile), hindari race saat config berubah
+        if (!config.Enabled)
+            return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+
+        int msg = wParam.ToInt32();
+
+        // Filter pesan yang sama sekali tidak kita proses SEBELUM marshaling struct
+        // (WM_MOUSEMOVE sangat sering terjadi, terutama di mouse gaming polling-rate
+        // tinggi -- marshaling per event ini adalah overhead yang tidak perlu).
+        if (msg != WM_LBUTTONDOWN && msg != WM_LBUTTONUP &&
+            msg != WM_RBUTTONDOWN && msg != WM_RBUTTONUP &&
+            msg != WM_MBUTTONDOWN && msg != WM_MBUTTONUP &&
+            msg != WM_MOUSEWHEEL)
+        {
+            return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+        }
 
         var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
 
@@ -72,22 +160,20 @@ public sealed class MouseHookEngine : IDisposable
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
         }
 
-        int msg = wParam.ToInt32();
-
         switch (msg)
         {
             case WM_LBUTTONDOWN:
-                return HandleButtonDown(_config.LeftButtonAction, _leftStopwatch, ref _suppressNextLeftUpEcho, nCode, wParam, lParam);
+                return HandleButtonDown(config.LeftButtonAction, ref _suppressNextLeftUpEcho, nCode, wParam, lParam);
             case WM_LBUTTONUP:
                 if (_suppressNextLeftUpEcho)
                 {
                     _suppressNextLeftUpEcho = false;
-                    return (IntPtr)1; // suppress juga event UP asli
+                    return (IntPtr)1;
                 }
                 break;
 
             case WM_RBUTTONDOWN:
-                return HandleButtonDown(_config.RightButtonAction, _rightStopwatch, ref _suppressNextRightUpEcho, nCode, wParam, lParam);
+                return HandleButtonDown(config.RightButtonAction, ref _suppressNextRightUpEcho, nCode, wParam, lParam);
             case WM_RBUTTONUP:
                 if (_suppressNextRightUpEcho)
                 {
@@ -97,7 +183,7 @@ public sealed class MouseHookEngine : IDisposable
                 break;
 
             case WM_MBUTTONDOWN:
-                return HandleButtonDown(_config.MiddleButtonAction, _middleStopwatch, ref _suppressNextMiddleUpEcho, nCode, wParam, lParam);
+                return HandleButtonDown(config.MiddleButtonAction, ref _suppressNextMiddleUpEcho, nCode, wParam, lParam);
             case WM_MBUTTONUP:
                 if (_suppressNextMiddleUpEcho)
                 {
@@ -107,7 +193,7 @@ public sealed class MouseHookEngine : IDisposable
                 break;
 
             case WM_MOUSEWHEEL:
-                return HandleWheel(data, nCode, wParam, lParam);
+                return HandleWheel(data, config, nCode, wParam, lParam);
         }
 
         return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
@@ -115,7 +201,6 @@ public sealed class MouseHookEngine : IDisposable
 
     private IntPtr HandleButtonDown(
         MouseAction action,
-        Stopwatch clickTimer,
         ref bool suppressUpEcho,
         int nCode, IntPtr wParam, IntPtr lParam)
     {
@@ -126,36 +211,36 @@ public sealed class MouseHookEngine : IDisposable
 
             case MouseAction.Disabled:
                 suppressUpEcho = true;
-                return (IntPtr)1; // telan DOWN, UP berikutnya juga akan ditelan
+                return (IntPtr)1;
 
             case MouseAction.LeftClick:
                 suppressUpEcho = true;
-                SendSyntheticClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+                EnqueueClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
                 return (IntPtr)1;
 
             case MouseAction.RightClick:
                 suppressUpEcho = true;
-                SendSyntheticClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+                EnqueueClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
                 return (IntPtr)1;
 
             case MouseAction.MiddleClick:
                 suppressUpEcho = true;
-                SendSyntheticClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+                EnqueueClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
                 return (IntPtr)1;
 
             case MouseAction.DoubleLeftClick:
                 suppressUpEcho = true;
-                SendSyntheticDoubleClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+                EnqueueClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, repeat: 2);
                 return (IntPtr)1;
 
             case MouseAction.DoubleRightClick:
                 suppressUpEcho = true;
-                SendSyntheticDoubleClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+                EnqueueClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, repeat: 2);
                 return (IntPtr)1;
 
             case MouseAction.DoubleMiddleClick:
                 suppressUpEcho = true;
-                SendSyntheticDoubleClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+                EnqueueClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, repeat: 2);
                 return (IntPtr)1;
 
             default:
@@ -163,13 +248,12 @@ public sealed class MouseHookEngine : IDisposable
         }
     }
 
-    private IntPtr HandleWheel(MSLLHOOKSTRUCT data, int nCode, IntPtr wParam, IntPtr lParam)
+    private IntPtr HandleWheel(MSLLHOOKSTRUCT data, RemapConfig config, int nCode, IntPtr wParam, IntPtr lParam)
     {
-        // mouseData bagian tinggi berisi delta wheel (120 = satu "tick" ke atas, -120 = ke bawah)
         short delta = (short)((data.mouseData >> 16) & 0xFFFF);
         bool isUp = delta > 0;
 
-        var action = isUp ? _config.ScrollUpAction : _config.ScrollDownAction;
+        var action = isUp ? config.ScrollUpAction : config.ScrollDownAction;
 
         switch (action)
         {
@@ -177,18 +261,18 @@ public sealed class MouseHookEngine : IDisposable
                 return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
 
             case ScrollAction.Disabled:
-                return (IntPtr)1; // telan scroll, tidak diteruskan
+                return (IntPtr)1;
 
             case ScrollAction.LeftClickPerTick:
-                SendSyntheticClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+                EnqueueClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
                 return (IntPtr)1;
 
             case ScrollAction.RightClickPerTick:
-                SendSyntheticClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+                EnqueueClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
                 return (IntPtr)1;
 
             case ScrollAction.MiddleClickPerTick:
-                SendSyntheticClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
+                EnqueueClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
                 return (IntPtr)1;
 
             default:
