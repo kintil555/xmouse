@@ -151,12 +151,17 @@ public sealed class MouseHookEngine : IDisposable
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
         }
 
-        var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-
-        // Event yang kita injeksikan sendiri (dwExtraInfo == signature) harus selalu
-        // diteruskan apa adanya, jangan diproses lagi -> mencegah rekursi tak terbatas.
-        if ((uint)data.dwExtraInfo.ToInt64() == XMOUSE_INJECTED_SIGNATURE)
+        // Baca dwExtraInfo lebih dulu tanpa marshal seluruh struct (field terakhir,
+        // offset tetap: 2 int (POINT) + 3 uint = 20 byte pada x86, tapi karena struct
+        // punya IntPtr, offset berbeda antara x86/x64 -- marshal parsial lewat
+        // Marshal.ReadIntPtr jauh lebih murah daripada PtrToStructure penuh untuk
+        // WM_LBUTTONDOWN/UP dkk yang tidak butuh field lain sama sekali.
+        int extraInfoOffset = IntPtr.Size == 8 ? 16 : 12; // POINT(8) + mouseData(4) + flags(4) + time(4)
+        IntPtr extraInfo = Marshal.ReadIntPtr(lParam, extraInfoOffset);
+        if ((uint)extraInfo.ToInt64() == XMOUSE_INJECTED_SIGNATURE)
         {
+            // Event injeksi kita sendiri -> selalu teruskan apa adanya, jangan diproses ulang
+            // (mencegah rekursi tak terbatas).
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
         }
 
@@ -193,6 +198,8 @@ public sealed class MouseHookEngine : IDisposable
                 break;
 
             case WM_MOUSEWHEEL:
+                // Hanya wheel yang butuh mouseData -> marshal struct penuh di sini saja.
+                var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 return HandleWheel(data, config, nCode, wParam, lParam);
         }
 

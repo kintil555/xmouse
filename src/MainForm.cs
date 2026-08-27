@@ -3,6 +3,7 @@ namespace XMouse;
 public class MainForm : Form
 {
     private readonly MouseHookEngine _engine;
+    private readonly HotkeyManager _hotkeyManager = new();
     private RemapConfig _config;
 
     private NotifyIcon _trayIcon = null!;
@@ -18,6 +19,7 @@ public class MainForm : Form
     private CheckBox _enabledCheck = null!;
     private CheckBox _startupCheck = null!;
     private CheckBox _startMinimizedCheck = null!;
+    private HotkeyBox _hotkeyBox = null!;
 
     private static readonly (MouseAction Value, string Label)[] ButtonActions =
     [
@@ -49,6 +51,9 @@ public class MainForm : Form
         BuildTrayIcon();
         LoadConfigIntoUi();
 
+        _hotkeyManager.HotkeyPressed += OnToggleHotkeyPressed;
+        _hotkeyManager.Register(_config.ToggleHotkey);
+
         // _engine.Start() bisa throw InvalidOperationException kalau pasang hook
         // gagal (mis. butuh Administrator) -- biarkan exception naik ke Program.cs
         // supaya pengguna dapat pesan jelas, bukan aplikasi diam-diam tidak jalan.
@@ -66,7 +71,7 @@ public class MainForm : Form
     {
         Text = "xmouse - Pengatur Mouse";
         Width = 460;
-        Height = 480;
+        Height = 510;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -76,7 +81,7 @@ public class MainForm : Form
             Dock = DockStyle.Fill,
             Padding = new Padding(16),
             ColumnCount = 2,
-            RowCount = 10,
+            RowCount = 12,
             AutoSize = true,
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
@@ -125,6 +130,22 @@ public class MainForm : Form
         row++;
 
         AddSectionLabel(layout, "Lainnya", ref row);
+
+        layout.Controls.Add(new Label { Text = "Keybind aktif/nonaktifkan ->", AutoSize = true, Anchor = AnchorStyles.Left }, 0, row);
+        _hotkeyBox = new HotkeyBox { Width = 220 };
+        _hotkeyBox.HotkeyChanged += (_, _) =>
+        {
+            _config.ToggleHotkey = _hotkeyBox.Value;
+            if (!_hotkeyManager.Register(_config.ToggleHotkey))
+            {
+                MessageBox.Show(this,
+                    "Kombinasi tombol itu sudah dipakai aplikasi lain. Coba kombinasi lain.",
+                    "xmouse", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            ApplyAndSave();
+        };
+        layout.Controls.Add(_hotkeyBox, 1, row);
+        row++;
 
         layout.Controls.Add(new Label { Text = "Interval double-click (ms)", AutoSize = true, Anchor = AnchorStyles.Left }, 0, row);
         _intervalNumeric = new NumericUpDown { Minimum = 10, Maximum = 500, Value = 50, Width = 100 };
@@ -205,6 +226,17 @@ public class MainForm : Form
         _intervalNumeric.Value = Math.Clamp(_config.DoubleClickIntervalMs, (int)_intervalNumeric.Minimum, (int)_intervalNumeric.Maximum);
         _startMinimizedCheck.Checked = _config.StartMinimized;
         _startupCheck.Checked = _config.RunOnStartup;
+        _hotkeyBox.Value = _config.ToggleHotkey;
+    }
+
+    /// <summary>Dipanggil dari HotkeyManager (thread UI, lewat message-only window) saat keybind ditekan di mana pun.</summary>
+    private void OnToggleHotkeyPressed()
+    {
+        _config.Enabled = !_config.Enabled;
+        _enabledCheck.Checked = _config.Enabled; // trigger ApplyAndSave via event yang sudah ada
+        _trayIcon.ShowBalloonTip(800, "xmouse",
+            _config.Enabled ? "Remap diaktifkan" : "Remap dijeda (pause)",
+            ToolTipIcon.Info);
     }
 
     private static void SelectByValue(ComboBox combo, MouseAction value)
@@ -300,6 +332,7 @@ public class MainForm : Form
         // 500ms) tidak lagi membuat tray icon menggantung terlihat oleh pengguna.
         _trayIcon.Visible = false;
         _engine.Dispose();
+        _hotkeyManager.Dispose();
         _trayIcon.Dispose();
         Application.Exit();
     }

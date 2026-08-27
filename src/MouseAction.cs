@@ -49,4 +49,7 @@ public class RemapConfig
 
     /// <summary>Jalankan otomatis saat Windows startup.</summary>
     public bool RunOnStartup { get; set; } = false;
+
+    /// <summary>Keybind global untuk toggle aktif/nonaktif (pause/resume) tanpa buka tray.</summary>
+    public HotkeyConfig ToggleHotkey { get; set; } = new();
 }
