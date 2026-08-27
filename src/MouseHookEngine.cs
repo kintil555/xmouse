@@ -21,6 +21,12 @@ namespace XMouse;
 /// </summary>
 public sealed class MouseHookEngine : IDisposable
 {
+    // Dihitung sekali oleh runtime lewat Marshal.OffsetOf -- selalu benar di x86/x64,
+    // tidak bergantung asumsi manual soal struct padding/alignment (lihat catatan
+    // di HookCallback soal bug offset hardcode sebelumnya).
+    private static readonly int ExtraInfoOffset =
+        Marshal.OffsetOf<MSLLHOOKSTRUCT>(nameof(MSLLHOOKSTRUCT.dwExtraInfo)).ToInt32();
+
     private IntPtr _hookHandle = IntPtr.Zero;
     private readonly LowLevelMouseProc _proc;
     private volatile RemapConfig _config;
@@ -151,13 +157,15 @@ public sealed class MouseHookEngine : IDisposable
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
         }
 
-        // Baca dwExtraInfo lebih dulu tanpa marshal seluruh struct (field terakhir,
-        // offset tetap: 2 int (POINT) + 3 uint = 20 byte pada x86, tapi karena struct
-        // punya IntPtr, offset berbeda antara x86/x64 -- marshal parsial lewat
-        // Marshal.ReadIntPtr jauh lebih murah daripada PtrToStructure penuh untuk
-        // WM_LBUTTONDOWN/UP dkk yang tidak butuh field lain sama sekali.
-        int extraInfoOffset = IntPtr.Size == 8 ? 16 : 12; // POINT(8) + mouseData(4) + flags(4) + time(4)
-        IntPtr extraInfo = Marshal.ReadIntPtr(lParam, extraInfoOffset);
+        // Baca dwExtraInfo lebih dulu tanpa marshal seluruh struct (field terakhir).
+        // PENTING: struct MSLLHOOKSTRUCT punya IntPtr (dwExtraInfo) di akhir, jadi
+        // di x64 struct di-pad ke alignment 8 byte SEBELUM field itu -- offset asli
+        // adalah 24 (bukan 16). Offset 16 yang salah membuat kita membaca separuh
+        // field time+padding, bukan dwExtraInfo, sehingga signature injeksi kita
+        // sendiri TIDAK TERBACA -> event klik sintetis yang kita kirim dianggap
+        // klik asli -> diproses ulang -> rekursi klik tak terbatas ("mouse gila").
+        // Pakai Marshal.OffsetOf agar benar di x86 maupun x64, tidak hardcode lagi.
+        IntPtr extraInfo = Marshal.ReadIntPtr(lParam, ExtraInfoOffset);
         if ((uint)extraInfo.ToInt64() == XMOUSE_INJECTED_SIGNATURE)
         {
             // Event injeksi kita sendiri -> selalu teruskan apa adanya, jangan diproses ulang
